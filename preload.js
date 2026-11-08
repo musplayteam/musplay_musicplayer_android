@@ -1,0 +1,73 @@
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
+
+// The main process can deliver files immediately after did-finish-load, while
+// React may not have mounted its listeners yet. Buffer those paths in preload.
+let pendingAudioFiles = [];
+const audioFileListeners = new Set();
+ipcRenderer.on('audio:open-files', (_event, paths) => {
+  const safePaths = Array.isArray(paths) ? paths.filter(value => typeof value === 'string') : [];
+  if (!safePaths.length) return;
+  if (audioFileListeners.size) {
+    for (const callback of audioFileListeners) callback(safePaths);
+  } else {
+    pendingAudioFiles.push(...safePaths);
+  }
+});
+
+contextBridge.exposeInMainWorld('electronAPI', {
+  minimize: () => ipcRenderer.send('minimize'),
+  maximize: () => ipcRenderer.send('maximize'),
+  close: () => ipcRenderer.send('close'),
+  getMinimizeToTray: () => ipcRenderer.invoke('app:getMinimizeToTray'),
+  getStartupWithWindows: () => ipcRenderer.invoke('app:getStartupWithWindows'),
+  setStartupWithWindows: (enabled) => ipcRenderer.invoke('app:setStartupWithWindows', Boolean(enabled)),
+  showTrackNotification: (payload) => ipcRenderer.invoke('app:showTrackNotification', payload),
+  openDefaultAppsSettings: () => ipcRenderer.invoke('app:openDefaultAppsSettings'),
+  setMinimizeToTray: (enabled) => ipcRenderer.invoke('app:setMinimizeToTray', Boolean(enabled)),
+  setTrayLanguage: (language) => ipcRenderer.invoke('app:setTrayLanguage', language),
+  getMediaShortcutStatus: () => ipcRenderer.invoke('app:getMediaShortcutStatus'),
+  resolveAudioPaths: (paths) => ipcRenderer.invoke('audio:resolve-paths', paths),
+  getPathForFile: (file) => {
+    try { return webUtils.getPathForFile(file); } catch { return ''; }
+  },
+  chooseMusicFolders: () => ipcRenderer.invoke('audio:choose-folders'),
+  scanAudioFolders: async (folders) => {
+    const result = await ipcRenderer.invoke('audio:scan-folders', folders);
+    return { files: Array.isArray(result?.files) ? result.files : [], truncated: Boolean(result?.truncated), skippedLarge: Number(result?.skippedLarge) || 0 };
+  },
+  writeAudioTags: (filePath, tags) => ipcRenderer.invoke('audio:write-tags', filePath, tags),
+  showAudioInFolder: (filePath) => ipcRenderer.invoke('audio:show-in-folder', filePath),
+  sendMediaSessionAction: (action) => {
+    const allowed = new Set(['play', 'pause', 'previous', 'next', 'stop']);
+    if (allowed.has(action)) ipcRenderer.send('media:session-action', action);
+  },
+  onMediaAction: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    const listener = (_event, action) => callback(action);
+    ipcRenderer.on('media:action', listener);
+    return () => ipcRenderer.removeListener('media:action', listener);
+  },
+  onOpenAudioFiles: (callback) => {
+    if (typeof callback !== 'function') return () => {};
+    audioFileListeners.add(callback);
+    if (pendingAudioFiles.length) {
+      const queued = [...new Set(pendingAudioFiles)];
+      pendingAudioFiles = [];
+      queueMicrotask(() => { if (audioFileListeners.has(callback)) callback(queued); });
+    }
+    return () => audioFileListeners.delete(callback);
+  },
+  isMaximized: () => ipcRenderer.invoke('isMaximized'),
+  getAppVersion: () => ipcRenderer.invoke('app:getVersion'),
+  checkUpdates: () => ipcRenderer.invoke('app:checkUpdates'),
+  openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
+  checkMusixmatchAvailability: () => ipcRenderer.invoke('lyrics:musixmatch:check'),
+  getMusixmatchLyrics: (track) => ipcRenderer.invoke('lyrics:musixmatch', track),
+  getSavedLyrics: (track) => ipcRenderer.invoke('lyrics:saved:get', track),
+  importLocalLyrics: (track) => ipcRenderer.invoke('lyrics:saved:import-file', track),
+  searchSavedLyrics: (query) => ipcRenderer.invoke('lyrics:saved:search', query),
+  saveSyncedLyrics: (payload) => ipcRenderer.invoke('lyrics:saved:save', payload),
+  getLyricsFolder: () => ipcRenderer.invoke('lyrics:saved:folder'),
+  requestLyrics: (request) => ipcRenderer.invoke('lyrics:request', request),
+  abortLyricsRequest: (requestId) => ipcRenderer.send('lyrics:abort', requestId),
+});

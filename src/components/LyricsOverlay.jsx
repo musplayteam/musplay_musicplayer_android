@@ -1,0 +1,198 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { X, RefreshCw, Loader2, FileMusic, SkipBack, SkipForward, Play, Pause, Shuffle, Repeat, Repeat1, Heart, ExternalLink, Music } from 'lucide-react';
+import usePlayerStore from '../store/playerStore';
+import { findLyrics, restoreLyricWordSpacing } from '../store/lyricsService';
+import { t, translateLyricsServiceMessage, translateLyricsSourceName } from '../i18n';
+import { isAndroid, saveAndroidText } from '../androidFiles';
+
+export default function LyricsOverlay({ open, onClose, onOpenSearch, language = 'ru' }) {
+  const [lyrics, setLyrics] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [retry, setRetry] = useState(0);
+  const [importingLocal, setImportingLocal] = useState(false);
+  const [localImportMessage, setLocalImportMessage] = useState('');
+  const [savingLrc, setSavingLrc] = useState(false);
+  const [mounted, setMounted] = useState(open);
+  const [entered, setEntered] = useState(false);
+  const activeLineRef = useRef(null);
+  const lyricsScrollRef = useRef(null);
+  const forceRefreshRef = useRef(false);
+  const { currentTrack, currentTime, isPlaying, togglePlay, nextTrack, prevTrack, toggleShuffle, toggleRepeat, repeatMode, isShuffle, favorites, toggleFavorite, volume, isMuted, setVolume } = usePlayerStore();
+
+  useEffect(() => {
+    let frameId;
+    let closeTimer;
+    if (open) {
+      setMounted(true);
+      frameId = requestAnimationFrame(() => setEntered(true));
+    } else {
+      setEntered(false);
+      closeTimer = window.setTimeout(() => setMounted(false), 440);
+    }
+    return () => {
+      if (frameId) cancelAnimationFrame(frameId);
+      if (closeTimer) window.clearTimeout(closeTimer);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open || !currentTrack) {
+      setLyrics(null);
+      setError('');
+      setLoading(false);
+      return undefined;
+    }
+    const controller = new AbortController();
+    setLyrics(null);
+    setError('');
+    setLoading(true);
+    const forceRefresh = forceRefreshRef.current;
+    forceRefreshRef.current = false;
+    findLyrics(currentTrack, controller.signal, { forceRefresh })
+      .then(result => {
+        if (controller.signal.aborted) return;
+        setLyrics(result);
+        if (result.status !== 'ok') setError(result.message || t('lyricsNotFoundGeneric', 'ru'));
+      })
+      .catch(err => {
+        if (!controller.signal.aborted && err?.name !== 'AbortError') setError('Не удалось загрузить текст песни.');
+      })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [open, currentTrack?.id, currentTrack?.title, currentTrack?.artist, currentTrack?.album, currentTrack?.duration, retry]);
+
+  const activeLineIndex = useMemo(() => lyrics?.lines?.reduce((active, line, index) => line.time <= currentTime ? index : active, -1) ?? -1, [lyrics, currentTime]);
+  const renderableLines = useMemo(() => (lyrics?.lines || []).map(line => ({ line, words: restoreLyricWordSpacing(line) })), [lyrics?.lines]);
+
+  useEffect(() => {
+    if (!open || activeLineIndex < 0) return;
+    const container = lyricsScrollRef.current;
+    const activeLine = activeLineRef.current;
+    if (!container || !activeLine) return;
+    const targetTop = activeLine.offsetTop - (container.clientHeight - activeLine.offsetHeight) / 2;
+    container.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+  }, [open, activeLineIndex]);
+
+  const importLocalLyrics = async () => {
+    const bridge = window.electronAPI;
+    if (!currentTrack || typeof bridge?.importLocalLyrics !== 'function') return;
+    setImportingLocal(true);
+    setLocalImportMessage('');
+    try {
+      const result = await bridge.importLocalLyrics({
+        title: currentTrack.title,
+        artist: currentTrack.artist,
+        album: currentTrack.album || '',
+      });
+      if (result?.canceled) return;
+      forceRefreshRef.current = true;
+      setRetry(value => value + 1);
+      setLocalImportMessage(language === 'en' ? 'Local synced lyrics imported.' : 'Локальный синхронный текст импортирован.');
+    } catch (err) {
+      setLocalImportMessage(err?.message || (language === 'en' ? 'Could not import this lyrics file.' : 'Не удалось импортировать файл текста.'));
+    } finally {
+      setImportingLocal(false);
+    }
+  };
+
+  const exportLrc = async () => {
+    if (!currentTrack || !lyrics?.lines?.length || !isAndroid()) return;
+    setSavingLrc(true);
+    try {
+      const toStamp = seconds => {
+        const safe = Math.max(0, Number(seconds) || 0);
+        const minutes = Math.floor(safe / 60);
+        const remainder = (safe % 60).toFixed(2).padStart(5, '0');
+        return `[${String(minutes).padStart(2, '0')}:${remainder}]`;
+      };
+      const content = lyrics.lines.map(line => `${toStamp(line.time)}${line.text || (line.words || []).map(word => word.text).join('')}`).join('\n');
+      const safeName = (currentTrack.title || currentTrack.fileName || 'lyrics').replace(/[\\/:*?"<>|]/g, '_');
+      const result = await saveAndroidText(`${safeName}.lrc`, content);
+      if (!result?.canceled) setLocalImportMessage(language === 'en' ? 'LRC file saved.' : 'Файл LRC сохранён.');
+    } catch (err) {
+      setLocalImportMessage(err?.message || (language === 'en' ? 'Could not save LRC.' : 'Не удалось сохранить LRC.'));
+    } finally { setSavingLrc(false); }
+  };
+
+  if (!mounted) return null;
+  const isFavorite = currentTrack && favorites.some(track => track.id === currentTrack.id);
+
+  return (
+    <section aria-hidden={!open} className={`musplay-lyrics-panel fixed inset-x-0 top-12 bottom-0 z-40 overflow-hidden bg-[#180b1a]/[0.97] text-white backdrop-blur-2xl ${entered ? 'is-open' : ''}`}>
+      <div className="musplay-lyrics-backdrop" aria-hidden="true">
+        {currentTrack?.cover ? <img src={currentTrack.cover} alt="" /> : null}
+        <div className="musplay-lyrics-backdrop-shade" />
+      </div>
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_18%_20%,rgba(128,30,40,0.22),transparent_48%),radial-gradient(ellipse_at_80%_75%,rgba(90,42,115,0.20),transparent_48%)] pointer-events-none" />
+      <div className="relative h-full min-h-0 flex flex-col">
+        <header className="shrink-0 h-14 flex items-center justify-between px-6 md:px-10 border-b border-white/[0.07]">
+          <div className="flex items-center gap-3"><FileMusic size={19} className="text-pink-300"/><span className="text-sm font-semibold tracking-wide">{t('lyricsOverlayTitle', language)}</span><span className="hidden sm:inline text-xs text-white/35">{t('syncedToPlayback', language)}</span></div>
+          <div className="flex items-center gap-2">
+            {!window.Capacitor?.isNativePlatform?.() && <button onClick={importLocalLyrics} disabled={importingLocal || !currentTrack} title={t('importLrcTooltip', language)} className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-xs text-white/70 hover:bg-white/10 hover:text-white disabled:opacity-40 transition"><FileMusic size={15}/><span className="hidden sm:inline">{importingLocal ? t('importLrcLoading', language) : t('importLrc', language)}</span></button>}
+            {isAndroid() && <button onClick={exportLrc} disabled={savingLrc || !lyrics?.lines?.length} title={language === 'en' ? 'Save LRC' : 'Сохранить LRC'} className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-xs text-white/70 hover:bg-white/10 hover:text-white disabled:opacity-40 transition"><FileMusic size={15}/><span>{savingLrc ? '…' : 'LRC'}</span></button>}
+            <button onClick={() => { forceRefreshRef.current = true; setRetry(value => value + 1); }} title={t('refreshLyrics', language)} className="rounded-full p-2 text-white/55 hover:bg-white/10 hover:text-white transition"><RefreshCw size={17}/></button>
+            <button onClick={onClose} title={t('closeLyrics', language)} className="rounded-full p-2 text-white/65 hover:bg-white/10 hover:text-white transition"><X size={19}/></button>
+          </div>
+        </header>
+
+        {!currentTrack ? <div className="flex-1 grid place-items-center text-white/50"><div className="text-center"><Music size={36} className="mx-auto mb-3"/><p>{t('playTrackToSeeLyrics', language)}</p></div></div> : (
+          <div className="musplay-lyrics-content flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(260px,0.85fr)_minmax(0,1.2fr)] gap-6 lg:gap-12 px-6 py-6 md:px-10 md:py-8 overflow-y-auto">
+            <div className="flex flex-col items-center justify-center min-w-0">
+              <div className="musplay-lyrics-cover relative group w-[min(58vw,330px)] lg:w-full lg:max-w-[340px] aspect-square rounded-2xl overflow-hidden bg-[#3d1218] shadow-[0_24px_80px_rgba(0,0,0,0.38)] ring-1 ring-white/10">
+                {currentTrack.cover ? <img src={currentTrack.cover} alt={t('coverAlt', language)} className="w-full h-full object-cover transition-transform duration-700 group-hover:scale-[1.035]"/> : <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-[#7f1520] to-[#27112d]"><Music size={70} className="text-white/45"/></div>}
+                <div className="absolute inset-0 bg-black/65 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col items-center justify-center gap-5">
+                  <div className="flex items-center gap-3">
+                    <button onClick={toggleShuffle} title={t('shuffle', language)} className={`w-10 h-10 rounded-full bg-black/55 flex items-center justify-center transition hover:bg-black/80 ${isShuffle ? 'text-pink-300' : 'text-white/75'}`}><Shuffle size={18}/></button>
+                    <button onClick={prevTrack} title={t('previousTrack', language)} className="w-10 h-10 rounded-full bg-black/55 text-white/85 flex items-center justify-center transition hover:bg-black/80"><SkipBack size={18} fill="currentColor"/></button>
+                    <button onClick={togglePlay} title={isPlaying ? t('pause', language) : t('playAction', language)} className="w-14 h-14 rounded-full bg-yellow-300 text-black flex items-center justify-center shadow-xl transition-transform hover:scale-105">{isPlaying ? <Pause size={23} fill="currentColor"/> : <Play size={23} fill="currentColor" className="ml-0.5"/>}</button>
+                    <button onClick={nextTrack} title={t('nextTrack', language)} className="w-10 h-10 rounded-full bg-black/55 text-white/85 flex items-center justify-center transition hover:bg-black/80"><SkipForward size={18} fill="currentColor"/></button>
+                    <button onClick={toggleRepeat} title={t('repeat', language)} className={`w-10 h-10 rounded-full bg-black/55 flex items-center justify-center transition hover:bg-black/80 ${repeatMode !== 'none' ? 'text-pink-300' : 'text-white/75'}`}>{repeatMode === 'one' ? <Repeat1 size={18}/> : <Repeat size={18}/>}</button>
+                  </div>
+                  {!isAndroid() && <div className="flex items-center gap-3 rounded-full bg-black/55 px-3 py-2" onClick={event => event.stopPropagation()}>
+                    <span className="text-xs text-white/60">{t('volume', language)}</span>
+                    <input type="range" aria-label={t('volume', language)} min="0" max="1" step="0.01" value={isMuted ? 0 : volume} onChange={event => setVolume(Number(event.target.value))} className="w-24 accent-pink-400 cursor-pointer" />
+                  </div>}
+                  <button onClick={() => toggleFavorite(currentTrack)} title={isFavorite ? t('removeFromLiked', language) : t('likeTrack', language)} className={`flex items-center gap-2 rounded-full px-4 py-2 bg-black/55 hover:bg-black/80 transition ${isFavorite ? 'text-pink-300' : 'text-white/80'}`}><Heart size={18} fill={isFavorite ? 'currentColor' : 'none'}/><span className="text-sm">{isFavorite ? t('inLikedSongs', language) : t('likeTrack', language)}</span></button>
+                </div>
+                <div className="absolute bottom-0 inset-x-0 p-4 bg-gradient-to-t from-black/65 to-transparent opacity-100 group-hover:opacity-0 transition-opacity duration-300 pointer-events-none"><p className="text-xs uppercase tracking-[0.2em] text-white/60">{t('currentlyPlaying', language)}</p></div>
+              </div>
+              <div className="musplay-lyrics-track-info w-full max-w-[340px] mt-5 text-center lg:text-left">
+                <h2 className="text-xl md:text-2xl font-bold tracking-tight truncate">{currentTrack.title || t('noTitleFallback', language)}</h2>
+                <p className="mt-1 text-sm md:text-base text-white/55 truncate">{currentTrack.artist || t('unknownArtist', language)}</p>
+                <p className="mt-4 text-xs text-white/35">{translateLyricsSourceName(lyrics?.sourceName, language) || (loading ? t('lyricsSourceLoading', language) : t('songLyrics', language))}</p>
+                {lyrics?.sourceUrl && <a href={lyrics.sourceUrl} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1.5 text-xs text-pink-200/70 hover:text-pink-100 transition">{t('openSource', language)} <ExternalLink size={12}/></a>}
+                {lyrics?.localPath && <p className="mt-2 text-[11px] text-white/30 break-all">{t('localCopy', language)} {lyrics.localPath}</p>}
+                {localImportMessage && <p role="status" className="mt-2 text-xs text-pink-200/80 break-words">{localImportMessage}</p>}
+              </div>
+            </div>
+
+            <div className="musplay-lyrics-list-column min-h-[320px] min-w-0 flex flex-col justify-center lg:pl-3">
+              {loading ? <div className="py-16 text-center text-white/55"><Loader2 size={26} className="animate-spin mx-auto mb-4 text-pink-200"/><p>{language === 'en' ? 'Searching lyric catalogs…' : 'Поиск по музыкальным каталогам…'}</p></div>
+                : error ? <div className="py-16 text-center lg:text-left"><p className="text-2xl md:text-3xl font-bold leading-snug text-white/75">{translateLyricsServiceMessage(error, language)}</p><button onClick={() => setRetry(value => value + 1)} className="mt-5 inline-flex items-center gap-2 rounded-full bg-white/10 px-4 py-2.5 text-sm hover:bg-white/15 transition"><RefreshCw size={15}/>{t('retrySearch', language)}</button></div>
+                : lyrics?.lines?.length ? <div ref={lyricsScrollRef} className="musplay-lyrics-list max-h-full overflow-y-auto py-10 pr-3 space-y-5 text-left scroll-smooth">
+                    {renderableLines.map(({ line, words: renderWords }, index) => <p key={`${line.time}-${index}`} ref={index === activeLineIndex ? activeLineRef : null} className={`origin-left text-2xl md:text-3xl xl:text-[2.5rem] font-extrabold leading-[1.18] tracking-tight transition-all duration-300 ${lyrics?.syncType === 'plain' ? 'text-white/85 opacity-100' : index === activeLineIndex ? 'text-white opacity-100 scale-[1.015]' : index < activeLineIndex ? 'text-white/38' : 'text-white/55 hover:text-white/75'}`}>
+                      {renderWords?.length ? renderWords.map((word, wordIndex) => { const nextWord = renderWords[wordIndex + 1]; const activeWord = index === activeLineIndex && currentTime >= word.time && (!nextWord || currentTime < nextWord.time); return <React.Fragment key={`${word.time}-${wordIndex}`}><span className={activeWord ? 'text-pink-200' : ''}>{word.text}</span>{wordIndex < renderWords.length - 1 ? (word.separator ?? ' ') : ''}</React.Fragment>; }) : (line.text || '♪')}
+                    </p>)}
+                  </div>
+                : <div className="py-16 text-center lg:text-left"><p className="text-2xl md:text-3xl font-bold leading-snug text-white/60">{t('noLyricsForSong', language)}</p><p className="mt-3 text-sm text-white/35">{t('searchLyricsInstruction', language)}</p><button onClick={onOpenSearch || onClose} className="mt-5 rounded-full bg-white/10 px-4 py-2.5 text-sm hover:bg-white/15 transition">{t('goToLyricsSearch', language)}</button></div>}
+            </div>
+          </div>
+        )}
+        {currentTrack && <div className="musplay-lyrics-mobile-controls" aria-label={language === 'en' ? 'Playback controls' : 'Управление воспроизведением'}>
+          <div className="musplay-lyrics-mobile-track">
+            <div className="musplay-lyrics-mobile-meta">
+              <div className="musplay-lyrics-mobile-title">{currentTrack.title || t('noTitleFallback', language)}</div>
+              <div className="musplay-lyrics-mobile-artist">{currentTrack.artist || t('unknownArtist', language)}</div>
+            </div>
+          </div>
+          <div className="musplay-lyrics-mobile-actions">
+            <button type="button" onClick={prevTrack} aria-label={t('previousTrack', language)} title={t('previousTrack', language)}><SkipBack size={23} fill="currentColor"/></button>
+            <button type="button" className="musplay-lyrics-mobile-play" onClick={togglePlay} aria-label={isPlaying ? t('pause', language) : t('playAction', language)} title={isPlaying ? t('pause', language) : t('playAction', language)}>{isPlaying ? <Pause size={22} fill="currentColor"/> : <Play size={22} fill="currentColor"/>}</button>
+            <button type="button" onClick={nextTrack} aria-label={t('nextTrack', language)} title={t('nextTrack', language)}><SkipForward size={23} fill="currentColor"/></button>
+          </div>
+        </div>}
+      </div>
+    </section>
+  );
+}
